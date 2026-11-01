@@ -1,0 +1,133 @@
+# Copyright 2026 The Agent Substrate Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Kubernetes resources for hack/e2e-kind.sh: a header-echo target, the worker
+# pool the probe actors run on, and a driver pod that calls the actors through
+# substrate's router. WORKER_IMAGE is substituted by the script with the worker
+# image of the cluster's substrate install.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: credprovider-openbao-e2e
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whoami
+  namespace: credprovider-openbao-e2e
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: whoami
+  template:
+    metadata:
+      labels:
+        app: whoami
+    spec:
+      containers:
+      - name: whoami
+        # Echoes the request it received, headers included.
+        image: docker.io/traefik/whoami:v1.11.0@sha256:200689790a0a0ea48ca45992e0450bc26ccab5307375b41c84dfc4f2475937ab
+        ports:
+        - name: http
+          containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: whoami
+  namespace: credprovider-openbao-e2e
+spec:
+  selector:
+    app: whoami
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+---
+apiVersion: ate.dev/v1
+kind: WorkerPool
+metadata:
+  name: probe
+  namespace: credprovider-openbao-e2e
+  labels:
+    workload: openbao-e2e
+spec:
+  # One actor runs per worker; the test suspends each actor after its turn.
+  replicas: 2
+  workerImage: WORKER_IMAGE
+  sandboxClasses:
+  - name: gvisor
+---
+# The driver reaches actors the way any router client does: mTLS to
+# atenet-router with its pod identity certificate, naming the actor in the
+# ate-target-actor header. The router admits it only if substrate's
+# ingressAllowedSPIFFEIDs lists
+#   spiffe://cluster.local/ns/credprovider-openbao-e2e/sa/e2e-driver
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: e2e-driver
+  namespace: credprovider-openbao-e2e
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: e2e-driver
+  namespace: credprovider-openbao-e2e
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: e2e-driver
+  template:
+    metadata:
+      labels:
+        app: e2e-driver
+    spec:
+      serviceAccountName: e2e-driver
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+      containers:
+      - name: curl
+        image: docker.io/curlimages/curl:8.17.0@sha256:935d9100e9ba842cdb060de42472c7ca90cfe9a7c96e4dacb55e79e560b3ff40
+        command: ["sleep", "infinity"]
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: router-client
+          mountPath: /run/router-client
+          readOnly: true
+      volumes:
+      # This pod's SPIFFE identity, and the CA atenet-router's serving
+      # certificate chains to.
+      - name: router-client
+        projected:
+          sources:
+          - podCertificate:
+              signerName: podidentity.podcert.ate.dev/identity
+              keyType: ECDSAP256
+              credentialBundlePath: credential-bundle.pem
+          - clusterTrustBundle:
+              signerName: servicedns.podcert.ate.dev/identity
+              labelSelector:
+                matchLabels:
+                  podcert.ate.dev/canarying: live
+              path: trust-bundle.pem

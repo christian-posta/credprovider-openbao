@@ -1,0 +1,173 @@
+# Copyright 2026 The Agent Substrate Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# A development OpenBao for kind. NOT FOR PRODUCTION: dev mode keeps all state
+# in memory (a restart loses it; rerun hack/kind/setup-openbao.sh) and starts
+# unsealed with a fixed root token.
+#
+# The plaintext dev listener binds to loopback for setup-openbao.sh, which
+# reaches it with kubectl exec. Everything else uses the TLS listener on 8200,
+# which serves a servicedns pod certificate for openbao.openbao.svc, so the
+# provider verifies it with the same trust bundle it uses for ateapi.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openbao
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: openbao
+  namespace: openbao
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openbao-listener
+  namespace: openbao
+data:
+  listener.hcl: |
+    listener "tcp" {
+      address       = "0.0.0.0:8200"
+      # A podCertificate credential bundle holds the chain and the key.
+      tls_cert_file = "/run/servicedns.podcert.ate.dev/credential-bundle.pem"
+      tls_key_file  = "/run/servicedns.podcert.ate.dev/credential-bundle.pem"
+      tls_min_version = "tls13"
+    }
+    # Every request, including which actor entity made it, on stdout.
+    # OpenBao manages audit devices only through configuration.
+    audit "file" "stdout" {
+      options {
+        file_path = "stdout"
+      }
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openbao
+  namespace: openbao
+spec:
+  type: ClusterIP
+  selector:
+    app: openbao
+  ports:
+  - name: https
+    port: 8200
+    targetPort: https
+    protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openbao
+  namespace: openbao
+  labels:
+    app: openbao
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: openbao
+  template:
+    metadata:
+      labels:
+        app: openbao
+    spec:
+      serviceAccountName: openbao
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 1000
+      containers:
+      - name: openbao
+        image: quay.io/openbao/openbao:2.6.1@sha256:5b2486ab0fb90bbc788cc345b0a08616dfb375873ee8be5df3a2fd4d378a67e0
+        command:
+        - bao
+        - server
+        - -dev
+        - -dev-no-store-token
+        - -dev-root-token-id=root
+        - -dev-listen-address=127.0.0.1:8201
+        - -config=/etc/openbao/listener.hcl
+        env:
+        - name: BAO_API_ADDR
+          value: https://openbao.openbao.svc:8200
+        - name: SKIP_SETCAP
+          value: "true"
+        ports:
+        - name: https
+          containerPort: 8200
+        readinessProbe:
+          tcpSocket:
+            port: https
+          periodSeconds: 5
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: listener
+          mountPath: /etc/openbao
+          readOnly: true
+        - name: servicedns
+          mountPath: /run/servicedns.podcert.ate.dev
+          readOnly: true
+      volumes:
+      - name: listener
+        configMap:
+          name: openbao-listener
+      # OpenBao's serving certificate for openbao.openbao.svc, and the CA that
+      # ate-idp-server's certificate chains to, used for OIDC discovery.
+      - name: servicedns
+        projected:
+          sources:
+          - podCertificate:
+              signerName: servicedns.podcert.ate.dev/identity
+              keyType: ECDSAP256
+              credentialBundlePath: credential-bundle.pem
+          - clusterTrustBundle:
+              signerName: servicedns.podcert.ate.dev/identity
+              labelSelector:
+                matchLabels:
+                  podcert.ate.dev/canarying: live
+              path: trust-bundle.pem
+---
+# Only the credential provider reaches OpenBao over the network.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openbao
+  namespace: openbao
+spec:
+  podSelector:
+    matchLabels:
+      app: openbao
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: credprovider-openbao
+      podSelector:
+        matchLabels:
+          app: openbao-credential-provider
+    ports:
+    - protocol: TCP
+      port: 8200
