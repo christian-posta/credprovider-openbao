@@ -56,7 +56,7 @@ release-manifest:
 undeploy:
 	kubectl delete -k config --ignore-not-found
 
-# A development OpenBao in kind, configured for substrate actor JWTs.
+# A development OpenBao in kind, configured for both provider modes.
 .PHONY: kind-openbao
 kind-openbao:
 	hack/kind/setup-openbao.sh

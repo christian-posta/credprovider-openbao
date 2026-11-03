@@ -14,8 +14,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Deploys the development OpenBao in hack/kind/openbao.yaml and configures it to
-# accept substrate actor JWTs:
+# Deploys the development OpenBao in hack/kind/openbao.yaml and configures it
+# for both provider variants.
+#
+# For the default provider (config/, --openbao-auth=kubernetes):
+#
+#   - Kubernetes auth at auth/kubernetes, verifying tokens with TokenReview.
+#   - Role substrate-credential-provider: binds the provider's ServiceAccount
+#     (credprovider-openbao/openbao-credential-provider) and audience
+#     "openbao".
+#   - Policy substrate-credential-provider: read every secret under
+#     secret/atespaces/. The provider limits each actor to its own atespace.
+#   - The audit log records the X-Substrate-Actor header the provider sends.
+#
+# For the actor-jwt variant (config/actor-jwt/):
 #
 #   - JWT auth at auth/jwt, trusting the issuer ate-idp-server publishes
 #     (OIDC discovery at ACTOR_JWT_ISSUER, https://idp.ate-system.svc by
@@ -56,8 +68,32 @@ echo "== deploying OpenBao"
 k apply -f "${ROOT}/hack/kind/openbao.yaml"
 k -n openbao rollout status deploy/openbao --timeout=180s
 
-echo "== JWT auth trusting ${ISSUER}"
 AUTH_MOUNTS="$(bao auth list -format=json)"
+
+echo "== Kubernetes auth for the provider's ServiceAccount"
+if ! grep -q '"kubernetes/"' <<<"${AUTH_MOUNTS}"; then
+  bao auth enable kubernetes
+fi
+# In the pod, OpenBao finds the API server's CA and its own reviewer token.
+bao write auth/kubernetes/config kubernetes_host=https://kubernetes.default.svc
+bao write auth/kubernetes/role/substrate-credential-provider \
+  bound_service_account_names=openbao-credential-provider \
+  bound_service_account_namespaces=credprovider-openbao \
+  audience=openbao \
+  token_policies=substrate-credential-provider \
+  token_ttl=5m \
+  token_max_ttl=5m
+bao policy write substrate-credential-provider - <<'POLICY'
+# The provider may read every atespace's secrets; it decides which actor gets
+# which.
+path "secret/data/atespaces/*" {
+  capabilities = ["read"]
+}
+POLICY
+# Log the actor the provider names on each read, in clear text.
+bao write sys/config/auditing/request-headers/x-substrate-actor hmac=false
+
+echo "== JWT auth trusting ${ISSUER}"
 if ! grep -q '"jwt/"' <<<"${AUTH_MOUNTS}"; then
   bao auth enable jwt
 fi
@@ -95,4 +131,5 @@ echo "OpenBao is ready. Store a secret for atespace <A> with:"
 echo "  kubectl -n openbao exec deploy/openbao -- env BAO_ADDR=http://127.0.0.1:8201 BAO_TOKEN=root \\"
 echo "    bao kv put secret/atespaces/<A>/example-api token=<value>"
 echo "and name it in an egress policy as:"
-echo "  ate-secret://openbao/kv/secret/atespaces/<A>/example-api/token"
+echo "  ate-secret://openbao/kv/secret/atespaces/<A>/example-api/token        (default provider)"
+echo "  ate-secret://openbao-actor/kv/secret/atespaces/<A>/example-api/token  (actor-jwt variant)"

@@ -17,20 +17,18 @@ package provider
 import (
 	"sync"
 	"time"
-
-	"plugins.go.ate.dev/credprovider-openbao/internal/actorid"
 )
 
 // sweepThreshold is the cache size above which an insert first drops expired
-// entries, so actors that stop calling do not accumulate.
+// entries, so keys that stop being used do not accumulate.
 const sweepThreshold = 1024
 
-// tokenCache holds each actor's OpenBao token until its reuse deadline.
+// tokenCache holds OpenBao tokens by key until their reuse deadline.
 type tokenCache struct {
 	now func() time.Time
 
 	mu      sync.Mutex
-	entries map[actorid.Ref]cachedToken
+	entries map[string]cachedToken
 }
 
 type cachedToken struct {
@@ -39,24 +37,24 @@ type cachedToken struct {
 }
 
 func newTokenCache(now func() time.Time) *tokenCache {
-	return &tokenCache{now: now, entries: map[actorid.Ref]cachedToken{}}
+	return &tokenCache{now: now, entries: map[string]cachedToken{}}
 }
 
-// get returns the actor's token if one is cached and still reusable.
-func (c *tokenCache) get(actor actorid.Ref) (string, bool) {
+// get returns key's token if one is cached and still reusable.
+func (c *tokenCache) get(key string) (string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	e, ok := c.entries[actor]
+	e, ok := c.entries[key]
 	if !ok || !c.now().Before(e.reuseUntil) {
 		return "", false
 	}
 	return e.value, true
 }
 
-// put caches token for the actor until a third of ttl remains, so a cached
+// put caches token for key until a third of ttl remains, so a cached
 // token always has that long left when it is used. A token with no TTL is not
 // cached.
-func (c *tokenCache) put(actor actorid.Ref, token string, ttl time.Duration) {
+func (c *tokenCache) put(key, token string, ttl time.Duration) {
 	if ttl <= 0 {
 		return
 	}
@@ -70,15 +68,15 @@ func (c *tokenCache) put(actor actorid.Ref, token string, ttl time.Duration) {
 			}
 		}
 	}
-	c.entries[actor] = cachedToken{value: token, reuseUntil: now.Add(ttl - ttl/3)}
+	c.entries[key] = cachedToken{value: token, reuseUntil: now.Add(ttl - ttl/3)}
 }
 
-// forget drops the actor's token if it is still token, so a token found to be
+// forget drops key's token if it is still token, so a token found to be
 // unusable is not served again while a fresh one may already be cached.
-func (c *tokenCache) forget(actor actorid.Ref, token string) {
+func (c *tokenCache) forget(key, token string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if e, ok := c.entries[actor]; ok && e.value == token {
-		delete(c.entries, actor)
+	if e, ok := c.entries[key]; ok && e.value == token {
+		delete(c.entries, key)
 	}
 }

@@ -19,6 +19,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -42,7 +44,8 @@ const (
 
 var testConfig = Config{
 	ProviderName: "openbao",
-	JWTMount:     "jwt",
+	Auth:         AuthActorJWT,
+	AuthMount:    "jwt",
 	Role:         "substrate-actor",
 	Audience:     "openbao",
 	JWTLifetime:  300 * time.Second,
@@ -83,6 +86,8 @@ func (m *fakeMinter) count() int {
 
 // fakeStore issues token "tok-<jwt>" for a login and serves reads from data,
 // unless loginErr or readErr is set. Tokens in revoked are refused with 403.
+// It records each login as mount|role|jwt and each read as
+// token|actor|mount/path.
 type fakeStore struct {
 	mu       sync.Mutex
 	ttl      time.Duration
@@ -96,7 +101,7 @@ type fakeStore struct {
 	readHook func(ctx context.Context) error
 }
 
-func (s *fakeStore) LoginJWT(_ context.Context, mount, role, jwt string) (openbao.Token, error) {
+func (s *fakeStore) Login(_ context.Context, mount, role, jwt string) (openbao.Token, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.logins = append(s.logins, mount+"|"+role+"|"+jwt)
@@ -106,7 +111,7 @@ func (s *fakeStore) LoginJWT(_ context.Context, mount, role, jwt string) (openba
 	return openbao.Token{Value: "tok-" + jwt, TTL: s.ttl}, nil
 }
 
-func (s *fakeStore) ReadKV2(ctx context.Context, token, mount string, path []string) (map[string]any, error) {
+func (s *fakeStore) ReadKV2(ctx context.Context, token, actor, mount string, path []string) (map[string]any, error) {
 	if s.readHook != nil {
 		if err := s.readHook(ctx); err != nil {
 			return nil, err
@@ -114,7 +119,7 @@ func (s *fakeStore) ReadKV2(ctx context.Context, token, mount string, path []str
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.reads = append(s.reads, token+"|"+mount+"/"+strings.Join(path, "/"))
+	s.reads = append(s.reads, token+"|"+actor+"|"+mount+"/"+strings.Join(path, "/"))
 	if s.revoked[token] {
 		return nil, &openbao.StatusError{Op: "read", Code: http.StatusForbidden}
 	}
@@ -144,7 +149,9 @@ func fetch(srv *Server, uri, actor string) (*credprovider.FetchSecretResponse, e
 func TestNewServerValidatesConfig(t *testing.T) {
 	for name, mutate := range map[string]func(*Config){
 		"no provider name": func(c *Config) { c.ProviderName = "" },
-		"no mount":         func(c *Config) { c.JWTMount = "" },
+		"no auth":          func(c *Config) { c.Auth = "" },
+		"unknown auth":     func(c *Config) { c.Auth = "token" },
+		"no mount":         func(c *Config) { c.AuthMount = "" },
 		"no role":          func(c *Config) { c.Role = "" },
 		"no audience":      func(c *Config) { c.Audience = "" },
 		"short lifetime":   func(c *Config) { c.JWTLifetime = 299 * time.Second },
@@ -157,6 +164,14 @@ func TestNewServerValidatesConfig(t *testing.T) {
 		if _, err := NewServer(cfg, &fakeMinter{}, newStore()); err == nil {
 			t.Errorf("%s: NewServer succeeded", name)
 		}
+	}
+	if _, err := NewServer(testConfig, nil, newStore()); err == nil {
+		t.Error("actor-jwt auth without a minter: NewServer succeeded")
+	}
+	cfg := kubernetesConfig(t)
+	cfg.TokenFile = ""
+	if _, err := NewServer(cfg, nil, newStore()); err == nil {
+		t.Error("kubernetes auth without a token file: NewServer succeeded")
 	}
 }
 
@@ -181,7 +196,7 @@ func TestFetchSecret(t *testing.T) {
 	if want := []string{"jwt|substrate-actor|jwt-team-a/alpha-1"}; fmt.Sprint(s.logins) != fmt.Sprint(want) {
 		t.Errorf("logins = %v, want %v", s.logins, want)
 	}
-	if want := []string{"tok-jwt-team-a/alpha-1|secret/atespaces/team-a/example-api"}; fmt.Sprint(s.reads) != fmt.Sprint(want) {
+	if want := []string{"tok-jwt-team-a/alpha-1|actor/team-a/alpha|secret/atespaces/team-a/example-api"}; fmt.Sprint(s.reads) != fmt.Sprint(want) {
 		t.Errorf("reads = %v, want %v", s.reads, want)
 	}
 }
@@ -201,7 +216,7 @@ func TestTokenReusedPerActor(t *testing.T) {
 	if _, err := fetch(srv, alphaURI, "spiffe://substrate-actor.local/actor/team-a/bravo"); err != nil {
 		t.Fatal(err)
 	}
-	if m.count() != 2 || s.reads[3] != "tok-jwt-team-a/bravo-2|secret/atespaces/team-a/example-api" {
+	if m.count() != 2 || s.reads[3] != "tok-jwt-team-a/bravo-2|actor/team-a/bravo|secret/atespaces/team-a/example-api" {
 		t.Errorf("second actor: mints=%d last read=%s", m.count(), s.reads[3])
 	}
 }
@@ -462,5 +477,144 @@ func TestFetchTimeout(t *testing.T) {
 	}
 	if d := time.Since(start); d > time.Second {
 		t.Errorf("fetch took %v, want about the 50ms timeout", d)
+	}
+}
+
+// kubernetesConfig returns a Config for AuthKubernetes whose token file holds
+// "sa-token".
+func kubernetesConfig(t *testing.T) Config {
+	t.Helper()
+	file := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(file, []byte("sa-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return Config{
+		ProviderName: "openbao",
+		Auth:         AuthKubernetes,
+		AuthMount:    "kubernetes",
+		Role:         "substrate-credential-provider",
+		TokenFile:    file,
+		FetchTimeout: 2 * time.Second,
+	}
+}
+
+func TestKubernetesAuthSharesTheProvidersToken(t *testing.T) {
+	s := newStore()
+	srv, err := NewServer(kubernetesConfig(t), nil, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, actor := range []string{"team-a/alpha", "team-a/bravo", "team-b/charlie"} {
+		atespace := strings.Split(actor, "/")[0]
+		uri := "ate-secret://openbao/kv/secret/atespaces/" + atespace + "/example-api/token"
+		resp, err := fetch(srv, uri, "spiffe://substrate-actor.local/actor/"+actor)
+		if err != nil {
+			t.Fatalf("%s: %v", actor, err)
+		}
+		if string(resp.GetOpaqueBytes()) != "hunter2" {
+			t.Errorf("%s: value = %q", actor, resp.GetOpaqueBytes())
+		}
+	}
+	if want := []string{"kubernetes|substrate-credential-provider|sa-token"}; fmt.Sprint(s.logins) != fmt.Sprint(want) {
+		t.Errorf("logins = %v, want one login as the provider: %v", s.logins, want)
+	}
+	want := []string{
+		"tok-sa-token|actor/team-a/alpha|secret/atespaces/team-a/example-api",
+		"tok-sa-token|actor/team-a/bravo|secret/atespaces/team-a/example-api",
+		"tok-sa-token|actor/team-b/charlie|secret/atespaces/team-b/example-api",
+	}
+	if fmt.Sprint(s.reads) != fmt.Sprint(want) {
+		t.Errorf("reads = %v, want %v", s.reads, want)
+	}
+}
+
+func TestKubernetesAuthDeniesSecretsOutsideTheActorsAtespace(t *testing.T) {
+	s := newStore()
+	srv, err := NewServer(kubernetesConfig(t), nil, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The message every denial carries, from a secret OpenBao lacks.
+	s.readErr = &openbao.StatusError{Op: "read", Code: http.StatusNotFound}
+	_, err = fetch(srv, alphaURI, alphaID)
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("missing secret: err = %v, want PermissionDenied", err)
+	}
+	reads := len(s.reads)
+	for _, uri := range []string{
+		"ate-secret://openbao/kv/secret/atespaces/team-b/example-api/token",
+		"ate-secret://openbao/kv/secret/atespaces/team-a/token",
+		"ate-secret://openbao/kv/secret/team-a/example-api/token",
+		"ate-secret://openbao/kv/secret/example-api/token",
+	} {
+		_, err := fetch(srv, uri, alphaID)
+		if status.Code(err) != codes.PermissionDenied {
+			t.Errorf("%s: err = %v, want PermissionDenied", uri, err)
+			continue
+		}
+		ref, _ := parseURI(uri, "openbao")
+		if want := "actor team-a/alpha is not permitted to read " + ref.String(); status.Convert(err).Message() != want {
+			t.Errorf("%s: message %q, want %q", uri, status.Convert(err).Message(), want)
+		}
+	}
+	if len(s.reads) != reads {
+		t.Errorf("denied requests reached OpenBao: %v", s.reads[reads:])
+	}
+}
+
+func TestKubernetesAuthRereadsTheTokenFile(t *testing.T) {
+	s := newStore()
+	cfg := kubernetesConfig(t)
+	srv, err := NewServer(cfg, nil, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fetch(srv, alphaURI, alphaID); err != nil {
+		t.Fatal(err)
+	}
+	// The kubelet rotates the token; the next login presents the new one.
+	if err := os.WriteFile(cfg.TokenFile, []byte("rotated"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.revoked["tok-sa-token"] = true
+	if _, err := fetch(srv, alphaURI, alphaID); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.logins) != 2 || s.logins[1] != "kubernetes|substrate-credential-provider|rotated" {
+		t.Errorf("logins = %v, want a second login with the rotated token", s.logins)
+	}
+}
+
+func TestKubernetesAuthErrorCodes(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		setup func(Config, *fakeStore)
+		want  codes.Code
+	}{
+		{"token file missing", func(c Config, _ *fakeStore) { _ = os.Remove(c.TokenFile) }, codes.Internal},
+		// The provider's own login is refused: misconfiguration, not a denial.
+		{"login refused 403", func(_ Config, s *fakeStore) {
+			s.loginErr = &openbao.StatusError{Op: "login", Code: http.StatusForbidden}
+		}, codes.Internal},
+		{"login refused 400", func(_ Config, s *fakeStore) {
+			s.loginErr = &openbao.StatusError{Op: "login", Code: http.StatusBadRequest}
+		}, codes.Internal},
+		{"login sealed", func(_ Config, s *fakeStore) {
+			s.loginErr = &openbao.StatusError{Op: "login", Code: http.StatusServiceUnavailable}
+		}, codes.Unavailable},
+		{"login transport", func(_ Config, s *fakeStore) { s.loginErr = errors.New("connection refused") }, codes.Unavailable},
+		{"read refused", func(_ Config, s *fakeStore) {
+			s.readErr = &openbao.StatusError{Op: "read", Code: http.StatusForbidden}
+		}, codes.PermissionDenied},
+	} {
+		cfg, s := kubernetesConfig(t), newStore()
+		tt.setup(cfg, s)
+		srv, err := NewServer(cfg, nil, s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fetch(srv, alphaURI, alphaID); status.Code(err) != tt.want {
+			t.Errorf("%s: code = %v, want %v (err %v)", tt.name, status.Code(err), tt.want, err)
+		}
 	}
 }

@@ -13,10 +13,13 @@
 // limitations under the License.
 
 // Package provider implements substrate's CredentialProvider API over OpenBao.
-// For each actor it mints a substrate actor JWT, logs in to OpenBao's JWT auth
-// method with it, and reads the secret with the actor's own OpenBao token, so
-// OpenBao's policies decide what each actor may read and its audit log names
-// the actor.
+// It logs in to OpenBao in one of two ways, set by Config.Auth:
+//
+//   - AuthKubernetes: once, as the provider's own ServiceAccount. The provider
+//     decides what each actor may read, and OpenBao sees the provider.
+//   - AuthActorJWT: as each actor, with a substrate actor JWT the provider
+//     mints. OpenBao's policies decide what each actor may read, and its audit
+//     log names the actor's entity.
 package provider
 
 import (
@@ -25,6 +28,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -46,22 +51,43 @@ type Minter interface {
 
 // Store is the OpenBao API the server uses. *openbao.Client satisfies it.
 type Store interface {
-	LoginJWT(ctx context.Context, mount, role, jwt string) (openbao.Token, error)
-	ReadKV2(ctx context.Context, token, mount string, path []string) (map[string]any, error)
+	Login(ctx context.Context, mount, role, jwt string) (openbao.Token, error)
+	ReadKV2(ctx context.Context, token, actor, mount string, path []string) (map[string]any, error)
 }
+
+// Auth selects the identity the provider logs in to OpenBao with.
+type Auth string
+
+const (
+	// AuthKubernetes logs in to OpenBao's Kubernetes auth method with the
+	// provider's ServiceAccount token. An actor may read secrets under
+	// atespaces/<its atespace>/ in any mount the provider's OpenBao policy
+	// allows.
+	AuthKubernetes Auth = "kubernetes"
+	// AuthActorJWT mints a substrate actor JWT for each actor and logs in to
+	// OpenBao's JWT auth method with it. The provider needs substrate's
+	// egress_gateway role to mint.
+	AuthActorJWT Auth = "actor-jwt"
+)
 
 // Config configures a Server.
 type Config struct {
 	// ProviderName is the ate-secret:// URI host this provider serves.
 	ProviderName string
-	// JWTMount is the path the OpenBao JWT auth method is mounted at.
-	JWTMount string
-	// Role is the OpenBao JWT auth role actors log in as.
+	// Auth selects how the provider logs in to OpenBao.
+	Auth Auth
+	// AuthMount is the path the OpenBao auth method is mounted at.
+	AuthMount string
+	// Role is the OpenBao auth role to log in as.
 	Role string
-	// Audience is the audience of the minted actor JWTs. The role must bind it.
+	// TokenFile is the ServiceAccount token presented with AuthKubernetes. It
+	// is read at each login, since the kubelet rotates it.
+	TokenFile string
+	// Audience is the audience of the minted actor JWTs with AuthActorJWT. The
+	// role must bind it.
 	Audience string
-	// JWTLifetime is the lifetime of the minted actor JWTs, 300s to 3600s.
-	// Only the login uses one, so the minimum serves.
+	// JWTLifetime is the lifetime of the minted actor JWTs with AuthActorJWT,
+	// 300s to 3600s. Only the login uses one, so the minimum serves.
 	JWTLifetime time.Duration
 	// FetchTimeout bounds each FetchSecret, which must answer within the
 	// egress gateway's provider budget.
@@ -72,16 +98,27 @@ func (c Config) validate() error {
 	switch {
 	case c.ProviderName == "":
 		return errors.New("a provider name is required")
-	case c.JWTMount == "":
-		return errors.New("an OpenBao JWT auth mount is required")
+	case c.AuthMount == "":
+		return errors.New("an OpenBao auth mount is required")
 	case c.Role == "":
-		return errors.New("an OpenBao JWT auth role is required")
-	case c.Audience == "":
-		return errors.New("an actor JWT audience is required")
-	case c.JWTLifetime < 300*time.Second || c.JWTLifetime > 3600*time.Second || c.JWTLifetime%time.Second != 0:
-		return fmt.Errorf("the actor JWT lifetime must be whole seconds from 300s to 3600s, got %v", c.JWTLifetime)
+		return errors.New("an OpenBao auth role is required")
 	case c.FetchTimeout <= 0:
 		return fmt.Errorf("the fetch timeout must be positive, got %v", c.FetchTimeout)
+	}
+	switch c.Auth {
+	case AuthKubernetes:
+		if c.TokenFile == "" {
+			return errors.New("a ServiceAccount token file is required")
+		}
+	case AuthActorJWT:
+		switch {
+		case c.Audience == "":
+			return errors.New("an actor JWT audience is required")
+		case c.JWTLifetime < 300*time.Second || c.JWTLifetime > 3600*time.Second || c.JWTLifetime%time.Second != 0:
+			return fmt.Errorf("the actor JWT lifetime must be whole seconds from 300s to 3600s, got %v", c.JWTLifetime)
+		}
+	default:
+		return fmt.Errorf("auth must be %q or %q, got %q", AuthKubernetes, AuthActorJWT, c.Auth)
 	}
 	return nil
 }
@@ -100,17 +137,19 @@ type Server struct {
 	flights singleflight.Group
 }
 
-// NewServer returns a Server that mints actor JWTs with minter and reads
-// secrets from store.
+// NewServer returns a Server that reads secrets from store. minter mints
+// actor JWTs and is required only with AuthActorJWT.
 func NewServer(cfg Config, minter Minter, store Store) (*Server, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
+	if cfg.Auth == AuthActorJWT && minter == nil {
+		return nil, errors.New("actor-jwt auth requires an actor JWT minter")
+	}
 	return &Server{cfg: cfg, minter: minter, store: store, tokens: newTokenCache(time.Now)}, nil
 }
 
-// FetchSecret resolves a credential URI to the string value of its field,
-// read with the asserted actor's own OpenBao token.
+// FetchSecret resolves a credential URI to the string value of its field.
 func (s *Server) FetchSecret(ctx context.Context, req *credprovider.FetchSecretRequest) (*credprovider.FetchSecretResponse, error) {
 	ref, err := parseURI(req.GetUri(), s.cfg.ProviderName)
 	if err != nil {
@@ -142,19 +181,26 @@ func (s *Server) FetchSecret(ctx context.Context, req *credprovider.FetchSecretR
 }
 
 func (s *Server) fetch(ctx context.Context, actor actorid.Ref, ref secretRef) ([]byte, error) {
-	token, fresh, err := s.token(ctx, actor)
+	if s.cfg.Auth == AuthKubernetes && !inAtespace(ref, actor.Atespace) {
+		slog.WarnContext(ctx, "credential request denied: secret is outside the actor's atespace",
+			slog.String("actor", actor.String()), slog.String("secret", ref.String()))
+		return nil, errDenied
+	}
+	key := s.tokenKey(actor)
+	token, fresh, err := s.token(ctx, key, actor)
 	if err != nil {
 		return nil, err
 	}
-	data, err := s.store.ReadKV2(ctx, token, ref.Mount, ref.Path)
+	onBehalfOf := "actor/" + actor.String()
+	data, err := s.store.ReadKV2(ctx, token, onBehalfOf, ref.Mount, ref.Path)
 	if !fresh && openbao.StatusCode(err) == http.StatusForbidden {
 		// A cached token can be revoked or expire early. Log in once more; a
 		// fresh token that is refused too is a real denial.
-		s.tokens.forget(actor, token)
-		if token, _, err = s.token(ctx, actor); err != nil {
+		s.tokens.forget(key, token)
+		if token, _, err = s.token(ctx, key, actor); err != nil {
 			return nil, err
 		}
-		data, err = s.store.ReadKV2(ctx, token, ref.Mount, ref.Path)
+		data, err = s.store.ReadKV2(ctx, token, onBehalfOf, ref.Mount, ref.Path)
 	}
 	if err != nil {
 		return nil, s.readError(ctx, actor, ref, err)
@@ -168,26 +214,45 @@ func (s *Server) fetch(ctx context.Context, actor actorid.Ref, ref secretRef) ([
 	return []byte(value), nil
 }
 
-// token returns an OpenBao token for the actor, and whether it was just issued
-// rather than taken from the cache. Concurrent requests for one actor share a
+// inAtespace reports whether ref names a secret under atespaces/<atespace>/.
+func inAtespace(ref secretRef, atespace string) bool {
+	return len(ref.Path) >= 3 && ref.Path[0] == "atespaces" && ref.Path[1] == atespace
+}
+
+// tokenKey names the cached OpenBao token a request for actor uses: the
+// provider's own with AuthKubernetes, the actor's with AuthActorJWT.
+func (s *Server) tokenKey(actor actorid.Ref) string {
+	if s.cfg.Auth == AuthKubernetes {
+		return ""
+	}
+	return actor.String()
+}
+
+// token returns the OpenBao token for key, and whether it was just issued
+// rather than taken from the cache. Concurrent requests for one key share a
 // single login.
-func (s *Server) token(ctx context.Context, actor actorid.Ref) (string, bool, error) {
-	if tok, ok := s.tokens.get(actor); ok {
+func (s *Server) token(ctx context.Context, key string, actor actorid.Ref) (string, bool, error) {
+	if tok, ok := s.tokens.get(key); ok {
 		return tok, false, nil
 	}
-	ch := s.flights.DoChan(actor.String(), func() (any, error) {
-		if tok, ok := s.tokens.get(actor); ok {
+	ch := s.flights.DoChan(key, func() (any, error) {
+		if tok, ok := s.tokens.get(key); ok {
 			return tok, nil
 		}
 		// Other requests may be waiting on this login, so one caller going
 		// away must not cancel it.
 		lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cfg.FetchTimeout)
 		defer cancel()
-		return s.login(lctx, actor)
+		tok, err := s.login(lctx, actor)
+		if err != nil {
+			return nil, err
+		}
+		s.tokens.put(key, tok.Value, tok.TTL)
+		return tok.Value, nil
 	})
 	select {
 	case <-ctx.Done():
-		return "", false, status.Errorf(codes.Unavailable, "logging in to OpenBao as actor %s: %v", actor, ctx.Err())
+		return "", false, status.Errorf(codes.Unavailable, "logging in to OpenBao: %v", ctx.Err())
 	case r := <-ch:
 		if r.Err != nil {
 			return "", false, r.Err
@@ -196,23 +261,33 @@ func (s *Server) token(ctx context.Context, actor actorid.Ref) (string, bool, er
 	}
 }
 
-// login mints an actor JWT and exchanges it for an OpenBao token, which it
-// caches.
-func (s *Server) login(ctx context.Context, actor actorid.Ref) (string, error) {
+// login logs in to OpenBao as the provider or, with AuthActorJWT, as actor.
+func (s *Server) login(ctx context.Context, actor actorid.Ref) (openbao.Token, error) {
+	if s.cfg.Auth == AuthKubernetes {
+		jwt, err := os.ReadFile(s.cfg.TokenFile)
+		if err != nil {
+			slog.ErrorContext(ctx, "reading the ServiceAccount token failed", slog.Any("err", err))
+			return openbao.Token{}, status.Error(codes.Internal, "credential provider cannot read its ServiceAccount token")
+		}
+		tok, err := s.store.Login(ctx, s.cfg.AuthMount, s.cfg.Role, strings.TrimSpace(string(jwt)))
+		if err != nil {
+			return openbao.Token{}, s.providerLoginError(ctx, err)
+		}
+		return tok, nil
+	}
 	resp, err := s.minter.MintActorJwt(ctx, &ateapi.MintActorJwtRequest{
 		Actor:             &ateapi.ObjectRef{Atespace: actor.Atespace, Name: actor.Name},
 		Audiences:         []string{s.cfg.Audience},
 		ExpirationSeconds: int64(s.cfg.JWTLifetime / time.Second),
 	})
 	if err != nil {
-		return "", s.mintError(ctx, actor, err)
+		return openbao.Token{}, s.mintError(ctx, actor, err)
 	}
-	tok, err := s.store.LoginJWT(ctx, s.cfg.JWTMount, s.cfg.Role, resp.GetActorJwt())
+	tok, err := s.store.Login(ctx, s.cfg.AuthMount, s.cfg.Role, resp.GetActorJwt())
 	if err != nil {
-		return "", s.loginError(ctx, actor, err)
+		return openbao.Token{}, s.actorLoginError(ctx, actor, err)
 	}
-	s.tokens.put(actor, tok.Value, tok.TTL)
-	return tok.Value, nil
+	return tok, nil
 }
 
 // The error mappings below target the egress gateway, which answers
@@ -236,7 +311,7 @@ func (s *Server) mintError(ctx context.Context, actor actorid.Ref, err error) er
 	}
 }
 
-func (s *Server) loginError(ctx context.Context, actor actorid.Ref, err error) error {
+func (s *Server) actorLoginError(ctx context.Context, actor actorid.Ref, err error) error {
 	switch code := openbao.StatusCode(err); {
 	case code == http.StatusBadRequest || code == http.StatusForbidden:
 		// OpenBao refused the actor's JWT, e.g. a role binding it does not meet.
@@ -246,10 +321,20 @@ func (s *Server) loginError(ctx context.Context, actor actorid.Ref, err error) e
 	case transient(code):
 		return status.Errorf(codes.Unavailable, "logging in to OpenBao as actor %s: %v", actor, err)
 	default:
-		slog.ErrorContext(ctx, "OpenBao login failed; check --openbao-jwt-mount and --openbao-role",
+		slog.ErrorContext(ctx, "OpenBao login failed; check --openbao-auth-mount and --openbao-role",
 			slog.String("actor", actor.String()), slog.Any("err", err))
 		return status.Errorf(codes.Internal, "logging in to OpenBao as actor %s failed", actor)
 	}
+}
+
+func (s *Server) providerLoginError(ctx context.Context, err error) error {
+	if transient(openbao.StatusCode(err)) {
+		return status.Errorf(codes.Unavailable, "logging in to OpenBao: %v", err)
+	}
+	// A refusal here is not about any actor: the provider itself cannot log in.
+	slog.ErrorContext(ctx, "OpenBao refused the provider's login; check --openbao-auth-mount, --openbao-role and the role's ServiceAccount binding",
+		slog.Any("err", err))
+	return status.Error(codes.Internal, "credential provider cannot log in to OpenBao")
 }
 
 func (s *Server) readError(ctx context.Context, actor actorid.Ref, ref secretRef, err error) error {

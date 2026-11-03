@@ -42,27 +42,24 @@ spec:
         - "--listen-address=:50051"
         - "--health-address=:9090"
         # A servicedns certificate for
-        # openbao-credential-provider.credprovider-openbao.svc, the name the
-        # egress gateway pins when it dials the provider.
+        # openbao-credential-provider.<namespace>.svc, the name the egress
+        # gateway pins when it dials the provider.
         - "--server-cred-bundle=/run/servicedns.podcert.ate.dev/credential-bundle.pem"
         # Admit only the egress gateway (atenet-egress in ate-system). Change
         # the namespace if substrate runs elsewhere.
         - "--client-ca-file=/run/podidentity.podcert.ate.dev/trust-bundle.pem"
         - "--injector-identity=spiffe://cluster.local/ns/ate-system/sa/atenet-egress"
-        # Mint actor JWTs through ateapi, authenticating with this pod's
-        # identity certificate.
-        - "--ateapi-address=dns:///api.ate-system.svc:443"
-        - "--ateapi-server-name=api.ate-system.svc"
-        - "--ateapi-ca-file=/run/servicedns.podcert.ate.dev/trust-bundle.pem"
-        - "--ateapi-client-cert=/run/podidentity.podcert.ate.dev/credential-bundle.pem"
+        # Log in to OpenBao's Kubernetes auth method as this pod's
+        # ServiceAccount, with the token projected below.
+        - "--openbao-auth=kubernetes"
+        - "--openbao-auth-mount=kubernetes"
+        - "--openbao-role=substrate-credential-provider"
+        - "--service-account-token-file=/var/run/secrets/openbao/token"
         # OpenBao, and the trust bundle its serving certificate chains to.
         # hack/kind/openbao.yaml serves a servicedns certificate; point these at
         # your own OpenBao and its CA otherwise.
         - "--openbao-address=https://openbao.openbao.svc:8200"
         - "--openbao-ca-file=/run/servicedns.podcert.ate.dev/trust-bundle.pem"
-        - "--openbao-jwt-mount=jwt"
-        - "--openbao-role=substrate-actor"
-        - "--actor-jwt-audience=openbao"
         - "--provider-name=openbao"
         - "--log-level=info"
         ports:
@@ -92,9 +89,12 @@ spec:
         - name: podidentity
           mountPath: /run/podidentity.podcert.ate.dev
           readOnly: true
+        - name: openbao-token
+          mountPath: /var/run/secrets/openbao
+          readOnly: true
       volumes:
       # The serving certificate, issued for the Services that select this pod,
-      # and the CA that ateapi's and OpenBao's serving certificates chain to.
+      # and the CA that OpenBao's serving certificate chains to.
       - name: servicedns
         projected:
           sources:
@@ -108,18 +108,22 @@ spec:
                 matchLabels:
                   podcert.ate.dev/canarying: live
               path: trust-bundle.pem
-      # This pod's SPIFFE identity, presented to ateapi, and the CA that the
-      # egress gateway's client certificate chains to.
+      # The CA that the egress gateway's client certificate chains to.
       - name: podidentity
         projected:
           sources:
-          - podCertificate:
-              signerName: podidentity.podcert.ate.dev/identity
-              keyType: ECDSAP256
-              credentialBundlePath: credential-bundle.pem
           - clusterTrustBundle:
               signerName: podidentity.podcert.ate.dev/identity
               labelSelector:
                 matchLabels:
                   podcert.ate.dev/canarying: live
               path: trust-bundle.pem
+      # This pod's ServiceAccount token, bound to OpenBao's audience, which
+      # OpenBao verifies with a TokenReview. The kubelet rotates it.
+      - name: openbao-token
+        projected:
+          sources:
+          - serviceAccountToken:
+              audience: openbao
+              expirationSeconds: 600
+              path: token

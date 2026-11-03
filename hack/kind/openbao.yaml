@@ -20,6 +20,10 @@
 # reaches it with kubectl exec. Everything else uses the TLS listener on 8200,
 # which serves a servicedns pod certificate for openbao.openbao.svc, so the
 # provider verifies it with the same trust bundle it uses for ateapi.
+#
+# OpenBao's Kubernetes auth method verifies the provider's ServiceAccount token
+# with a TokenReview, made with OpenBao's own ServiceAccount token, which the
+# system:auth-delegator binding below permits.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -31,6 +35,19 @@ metadata:
   name: openbao
   namespace: openbao
 automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: openbao-tokenreview
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+- kind: ServiceAccount
+  name: openbao
+  namespace: openbao
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -89,7 +106,8 @@ spec:
         app: openbao
     spec:
       serviceAccountName: openbao
-      automountServiceAccountToken: false
+      # The Kubernetes auth method makes TokenReviews with this token.
+      automountServiceAccountToken: true
       securityContext:
         runAsNonRoot: true
         runAsUser: 100
@@ -148,7 +166,8 @@ spec:
                   podcert.ate.dev/canarying: live
               path: trust-bundle.pem
 ---
-# Only the credential provider reaches OpenBao over the network.
+# Only the credential providers reach OpenBao over the network: the default
+# (config/) and the actor-jwt variant (config/actor-jwt/).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -165,6 +184,12 @@ spec:
     - namespaceSelector:
         matchLabels:
           kubernetes.io/metadata.name: credprovider-openbao
+      podSelector:
+        matchLabels:
+          app: openbao-credential-provider
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: credprovider-openbao-actor
       podSelector:
         matchLabels:
           app: openbao-credential-provider

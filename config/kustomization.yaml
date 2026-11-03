@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# The provider with --openbao-auth=kubernetes (the default), as provider
+# "openbao" in namespace credprovider-openbao. actor-jwt/ deploys the
+# --openbao-auth=actor-jwt variant next to it.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-- namespace.yaml
-- serviceaccount.yaml
-- deployment.yaml
-- service.yaml
-- networkpolicy.yaml
+- base

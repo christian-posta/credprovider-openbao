@@ -21,24 +21,37 @@
 #      for the actor's own atespace;
 #   2. an actor in another atespace naming that secret is refused (403);
 #   3. a secret that does not exist is refused the same way (403);
-#   4. OpenBao's audit log names the actor that read the secret;
+#   4. OpenBao's audit log names the actor that read the secret: in the
+#      X-Substrate-Actor header the provider sends, or with --actor-jwt, as the
+#      entity that logged in;
 #   5. with OpenBao down, a request needing a credential fails closed with a
 #      retryable 503.
 #
+# By default it tests the provider in config/ (--openbao-auth=kubernetes);
+# --actor-jwt tests config/actor-jwt/ instead.
+#
 # Prerequisites: substrate installed on kind from a checkout at the version in
-# go.mod, with this provider and identity wired in (see README.md):
+# go.mod, with the provider under test in the gateway's provider list (see
+# README.md):
 #
 #   ATE_CREDENTIAL_PROVIDER='[{"name":"k8s.io"},{"name":"openbao","address":"openbao-credential-provider.credprovider-openbao.svc:50051"}]'
-#   ATE_EGRESS_GATEWAY_EXTRA_SPIFFE_IDS=spiffe://cluster.local/ns/credprovider-openbao/sa/openbao-credential-provider
+#
+# With --actor-jwt, the provider is "openbao-actor" in namespace
+# credprovider-openbao-actor, and ate-api-server must also grant it the
+# egress_gateway role:
+#
+#   ATE_CREDENTIAL_PROVIDER='[{"name":"k8s.io"},{"name":"openbao-actor","address":"openbao-credential-provider.credprovider-openbao-actor.svc:50051"}]'
+#   ATE_EGRESS_GATEWAY_EXTRA_SPIFFE_IDS=spiffe://cluster.local/ns/credprovider-openbao-actor/sa/openbao-credential-provider
 #
 # and KO_DOCKER_REPO pointing at a registry the cluster pulls from
 # (localhost:5001 for substrate's kind setup). kubectl, kubectl-ate, ko-able Go,
 # curl and jq must be on PATH.
 #
 # Usage:
-#   hack/e2e-kind.sh             run the test (leaves its resources in place)
-#   hack/e2e-kind.sh --cleanup   delete everything the test created, including
-#                                the development OpenBao and the provider
+#   hack/e2e-kind.sh [--actor-jwt]  run the test (leaves its resources in place)
+#   hack/e2e-kind.sh --cleanup      delete everything the test created,
+#                                   including the development OpenBao and both
+#                                   provider variants
 #
 #   KUBECTL_CONTEXT  kubectl context (default: the current context)
 #   KUBECTL_ATE      kubectl-ate binary matching the cluster (default: kubectl-ate)
@@ -56,7 +69,12 @@ KATE=("${KUBECTL_ATE:-kubectl-ate}" --context "${CTX}")
 NS=credprovider-openbao-e2e
 TARGET="http://whoami.${NS}.svc.cluster.local/"
 TARGET_HOST="whoami.${NS}.svc.cluster.local"
-PROVIDER_ID=spiffe://cluster.local/ns/credprovider-openbao/sa/openbao-credential-provider
+MODE=kubernetes PROVIDER=openbao PROVIDER_NS=credprovider-openbao CONFIG=config
+if [[ "${1:-}" == "--actor-jwt" ]]; then
+  MODE=actor-jwt PROVIDER=openbao-actor PROVIDER_NS=credprovider-openbao-actor CONFIG=config/actor-jwt
+fi
+PROVIDER_ID=spiffe://cluster.local/ns/${PROVIDER_NS}/sa/openbao-credential-provider
+PROVIDER_ADDR=openbao-credential-provider.${PROVIDER_NS}.svc
 DRIVER_ID=spiffe://cluster.local/ns/${NS}/sa/e2e-driver
 ROUTER_URL=https://atenet-router.ate-system.svc/
 PLACEHOLDER="Bearer actor-placeholder"
@@ -82,7 +100,8 @@ cleanup() {
     "${KATE[@]}" delete actor-template probe -a "${as}" >/dev/null 2>&1 || true
     "${KATE[@]}" delete atespace "${as}" >/dev/null 2>&1 || true
   done
-  "${K[@]}" delete namespace "${NS}" credprovider-openbao openbao --ignore-not-found
+  "${K[@]}" delete namespace "${NS}" credprovider-openbao credprovider-openbao-actor openbao --ignore-not-found
+  "${K[@]}" delete clusterrolebinding openbao-tokenreview --ignore-not-found
 }
 
 if [[ "${1:-}" == "--cleanup" ]]; then
@@ -91,21 +110,21 @@ if [[ "${1:-}" == "--cleanup" ]]; then
 fi
 
 ##############################################################################
-log "preflight: substrate is wired for this provider"
+log "preflight: substrate is wired for the ${MODE} provider"
 ##############################################################################
 # Command output is captured before grepping: under pipefail, `kubectl ... |
 # grep -q` can fail on a match when grep exits early and kubectl takes SIGPIPE.
 API_SERVER="$("${K[@]}" -n ate-system get deploy ate-api-server -o json)"
 SYSTEM_CONFIG="$("${K[@]}" -n ate-system get deploy,configmap -o yaml)"
-if ! grep -q "${PROVIDER_ID}" <<<"${API_SERVER}"; then
+if [[ "${MODE}" == actor-jwt ]] && ! grep -q "${PROVIDER_ID}" <<<"${API_SERVER}"; then
   echo "ate-api-server does not grant ${PROVIDER_ID} the egress_gateway role." >&2
   echo "Reinstall substrate with ATE_EGRESS_GATEWAY_EXTRA_SPIFFE_IDS=${PROVIDER_ID}" >&2
   exit 1
 fi
-if ! grep -q 'openbao-credential-provider.credprovider-openbao.svc' <<<"${SYSTEM_CONFIG}"; then
-  echo "The egress gateway is not configured with the openbao provider." >&2
+if ! grep -q "${PROVIDER_ADDR}" <<<"${SYSTEM_CONFIG}"; then
+  echo "The egress gateway is not configured with the ${PROVIDER} provider." >&2
   echo "Reinstall substrate with ATE_CREDENTIAL_PROVIDER including" >&2
-  echo '  {"name":"openbao","address":"openbao-credential-provider.credprovider-openbao.svc:50051"}' >&2
+  echo "  {\"name\":\"${PROVIDER}\",\"address\":\"${PROVIDER_ADDR}:50051\"}" >&2
   exit 1
 fi
 if ! grep -q "${DRIVER_ID}" <<<"${SYSTEM_CONFIG}"; then
@@ -119,15 +138,18 @@ if [[ -z "${WORKER_IMAGE}" ]]; then
   echo "No WorkerPool to copy a worker image from; set WORKER_IMAGE." >&2
   exit 1
 fi
-pass "ate-api-server grants the provider egress_gateway; the gateway names the provider"
+pass "the gateway names the ${PROVIDER} provider"
 echo "worker image: ${WORKER_IMAGE}"
 
 ##############################################################################
 log "OpenBao and the provider"
 ##############################################################################
 KUBECTL_CONTEXT="${CTX}" hack/kind/setup-openbao.sh
-"${K[@]}" kustomize config | go run github.com/google/ko@v0.19.1 resolve --base-import-paths -f - | "${K[@]}" apply -f - >/dev/null
-"${K[@]}" -n credprovider-openbao rollout status deploy/openbao-credential-provider --timeout=180s
+"${K[@]}" kustomize "${CONFIG}" | go run github.com/google/ko@v0.19.1 resolve --base-import-paths -f - | "${K[@]}" apply -f - >/dev/null
+"${K[@]}" -n "${PROVIDER_NS}" rollout status deploy/openbao-credential-provider --timeout=180s
+# Start from an empty token cache.
+"${K[@]}" -n "${PROVIDER_NS}" rollout restart deploy/openbao-credential-provider >/dev/null
+"${K[@]}" -n "${PROVIDER_NS}" rollout status deploy/openbao-credential-provider --timeout=180s
 bao kv put secret/atespaces/team-a/example-api token=team-a-secret >/dev/null
 bao kv put secret/atespaces/team-b/example-api token=team-b-secret >/dev/null
 pass "OpenBao configured and seeded; provider rolled out"
@@ -157,10 +179,10 @@ policy() {
   sed -e "s#TARGET_HOST#${TARGET_HOST}#" -e "s#CREDENTIAL_URI#${uri}#" test/e2e/egress-policy.yaml \
     | "${KATE[@]}" create egress-policy "${ref#*/}" -a "${ref%/*}" -f - >/dev/null
 }
-policy team-a/alpha   ate-secret://openbao/kv/secret/atespaces/team-a/example-api/token
-policy team-b/bravo   ate-secret://openbao/kv/secret/atespaces/team-a/example-api/token
-policy team-a/charlie ate-secret://openbao/kv/secret/atespaces/team-a/no-such-secret/token
-policy team-a/delta   ate-secret://openbao/kv/secret/atespaces/team-a/example-api/token
+policy team-a/alpha   "ate-secret://${PROVIDER}/kv/secret/atespaces/team-a/example-api/token"
+policy team-b/bravo   "ate-secret://${PROVIDER}/kv/secret/atespaces/team-a/example-api/token"
+policy team-a/charlie "ate-secret://${PROVIDER}/kv/secret/atespaces/team-a/no-such-secret/token"
+policy team-a/delta   "ate-secret://${PROVIDER}/kv/secret/atespaces/team-a/example-api/token"
 pass "actors and egress policies created"
 
 # probe <atespace/actor> asks the actor, through the router, to fetch the echo
@@ -222,10 +244,22 @@ fi
 log "4. OpenBao's audit log names the actor"
 ##############################################################################
 AUDIT="$("${K[@]}" -n openbao logs deploy/openbao --tail=-1)"
-if grep -q 'jwt-actor/team-a/alpha' <<<"${AUDIT}"; then
-  pass "audit log entries name actor/team-a/alpha"
+# Successful reads of team-a's secret, as "<display name> <actor header>".
+READS="$(jq -rR 'fromjson? | select(.type == "response" and .request.path == "secret/data/atespaces/team-a/example-api" and .error == null)
+  | "\(.auth.display_name) \(.request.headers["x-substrate-actor"][0] // "-")"' <<<"${AUDIT}")"
+echo "${READS}" | sort | uniq -c
+if [[ "${MODE}" == kubernetes ]]; then
+  WANT="kubernetes-${PROVIDER_NS}-openbao-credential-provider actor/team-a/alpha"
 else
-  fail "no audit entry names actor/team-a/alpha"
+  WANT="jwt-actor/team-a/alpha actor/team-a/alpha"
+fi
+if grep -qx "${WANT}" <<<"${READS}"; then
+  pass "OpenBao logged the read as: ${WANT}"
+else
+  fail "no audit entry reads: ${WANT}"
+fi
+if grep -q 'actor/team-b/bravo' <<<"${READS}"; then
+  fail "OpenBao served team-a's secret for team-b/bravo"
 fi
 
 ##############################################################################

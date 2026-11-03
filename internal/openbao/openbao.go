@@ -13,7 +13,8 @@
 // limitations under the License.
 
 // Package openbao is a minimal client for the two OpenBao HTTP API calls the
-// provider makes: a JWT auth login and a KV version 2 read. It uses net/http
+// provider makes: a login to the JWT or Kubernetes auth method and a KV
+// version 2 read. It uses net/http
 // rather than the OpenBao SDK to keep the dependency tree small.
 package openbao
 
@@ -33,6 +34,11 @@ import (
 
 // maxResponseBytes bounds how much of a response body is read.
 const maxResponseBytes = 1 << 20
+
+// ActorHeader carries the actor a read is made for, as actor/<atespace>/<name>.
+// OpenBao does not interpret it; an audit device logs it once
+// sys/config/auditing/request-headers lists it.
+const ActorHeader = "X-Substrate-Actor"
 
 // Options configure a Client.
 type Options struct {
@@ -121,9 +127,10 @@ type Token struct {
 	TTL time.Duration
 }
 
-// LoginJWT logs in to the JWT auth method mounted at mount as role, presenting
-// jwt, and returns the issued token.
-func (c *Client) LoginJWT(ctx context.Context, mount, role, jwt string) (Token, error) {
+// Login logs in to the auth method mounted at mount as role, presenting jwt,
+// and returns the issued token. The JWT and Kubernetes auth methods share this
+// request shape.
+func (c *Client) Login(ctx context.Context, mount, role, jwt string) (Token, error) {
 	body, err := json.Marshal(map[string]string{"role": role, "jwt": jwt})
 	if err != nil {
 		return Token{}, err
@@ -134,7 +141,7 @@ func (c *Client) LoginJWT(ctx context.Context, mount, role, jwt string) (Token, 
 			LeaseDuration int64  `json:"lease_duration"`
 		} `json:"auth"`
 	}
-	if err := c.do(ctx, "login", http.MethodPost, c.base.JoinPath("v1", "auth", mount, "login"), "", body, &resp); err != nil {
+	if err := c.do(ctx, "login", http.MethodPost, c.base.JoinPath("v1", "auth", mount, "login"), "", "", body, &resp); err != nil {
 		return Token{}, err
 	}
 	if resp.Auth == nil || resp.Auth.ClientToken == "" {
@@ -144,15 +151,16 @@ func (c *Client) LoginJWT(ctx context.Context, mount, role, jwt string) (Token, 
 }
 
 // ReadKV2 reads the latest version of the KV version 2 secret at path in the
-// engine mounted at mount, and returns its data.
-func (c *Client) ReadKV2(ctx context.Context, token, mount string, path []string) (map[string]any, error) {
+// engine mounted at mount for actor, and returns its data. actor is sent in
+// ActorHeader.
+func (c *Client) ReadKV2(ctx context.Context, token, actor, mount string, path []string) (map[string]any, error) {
 	elems := append([]string{"v1", mount, "data"}, path...)
 	var resp struct {
 		Data *struct {
 			Data map[string]any `json:"data"`
 		} `json:"data"`
 	}
-	if err := c.do(ctx, "read", http.MethodGet, c.base.JoinPath(elems...), token, nil, &resp); err != nil {
+	if err := c.do(ctx, "read", http.MethodGet, c.base.JoinPath(elems...), token, actor, nil, &resp); err != nil {
 		return nil, err
 	}
 	if resp.Data == nil || resp.Data.Data == nil {
@@ -162,7 +170,7 @@ func (c *Client) ReadKV2(ctx context.Context, token, mount string, path []string
 	return resp.Data.Data, nil
 }
 
-func (c *Client) do(ctx context.Context, op, method string, u *url.URL, token string, body []byte, out any) error {
+func (c *Client) do(ctx context.Context, op, method string, u *url.URL, token, actor string, body []byte, out any) error {
 	var rd io.Reader
 	if body != nil {
 		rd = bytes.NewReader(body)
@@ -176,6 +184,9 @@ func (c *Client) do(ctx context.Context, op, method string, u *url.URL, token st
 	}
 	if token != "" {
 		req.Header.Set("X-Vault-Token", token)
+	}
+	if actor != "" {
+		req.Header.Set(ActorHeader, actor)
 	}
 	resp, err := c.hc.Do(req)
 	if err != nil {

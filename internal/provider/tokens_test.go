@@ -18,13 +18,11 @@ import (
 	"fmt"
 	"testing"
 	"time"
-
-	"plugins.go.ate.dev/credprovider-openbao/internal/actorid"
 )
 
 func TestTokenCacheForgetOnlyMatchingToken(t *testing.T) {
 	c := newTokenCache(time.Now)
-	a := actorid.Ref{Atespace: "team-a", Name: "alpha"}
+	a := "team-a/alpha"
 	c.put(a, "new", time.Minute)
 	c.forget(a, "old")
 	if tok, ok := c.get(a); !ok || tok != "new" {
@@ -40,10 +38,10 @@ func TestTokenCacheSweepsExpiredEntries(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	c := newTokenCache(func() time.Time { return now })
 	for i := range sweepThreshold {
-		c.put(actorid.Ref{Atespace: "a", Name: fmt.Sprintf("n%d", i)}, "t", 3*time.Second)
+		c.put(fmt.Sprintf("a/n%d", i), "t", 3*time.Second)
 	}
 	now = now.Add(3 * time.Second)
-	live := actorid.Ref{Atespace: "a", Name: "live"}
+	live := "a/live"
 	c.put(live, "t", time.Minute)
 	if len(c.entries) != 1 {
 		t.Errorf("entries = %d after a sweep, want only the live one", len(c.entries))

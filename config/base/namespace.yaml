@@ -12,12 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The provider calls ateapi to mint actor JWTs. ate-system's NetworkPolicy
-# admits ateapi traffic from namespaces carrying ate.dev/api-access, so the
-# provider runs in its own namespace rather than in ate-system.
 apiVersion: v1
 kind: Namespace
 metadata:
   name: credprovider-openbao
-  labels:
-    ate.dev/api-access: "true"

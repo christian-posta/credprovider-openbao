@@ -14,9 +14,9 @@
 
 // Command openbao-credential-provider serves substrate's CredentialProvider
 // gRPC API from OpenBao. The egress gateway calls it to resolve ate-secret://
-// URIs for credential injection. For each actor it mints a substrate actor JWT
-// and logs in to OpenBao as that actor, so OpenBao's policies decide what the
-// actor may read.
+// URIs for credential injection. It logs in to OpenBao as its own
+// ServiceAccount (--openbao-auth=kubernetes) or as each actor with a minted
+// substrate actor JWT (--openbao-auth=actor-jwt).
 package main
 
 import (
@@ -86,9 +86,14 @@ func parseFlags(fs *flag.FlagSet, args []string) (config, error) {
 	// the deployment.
 	fs.StringVar(&c.injectorIdentity, "injector-identity", "", "SPIFFE ID the caller's client certificate must carry: substrate's egress gateway, e.g. spiffe://cluster.local/ns/ate-system/sa/atenet-egress (required)")
 
-	fs.StringVar(&c.ateapiAddr, "ateapi-address", "dns:///api.ate-system.svc:443", "gRPC target of substrate's ateapi, which mints actor JWTs")
-	fs.StringVar(&c.ateapiCAFile, "ateapi-ca-file", "", "trust bundle ateapi's serving certificate must chain to (required)")
-	fs.StringVar(&c.ateapiClientCert, "ateapi-client-cert", "", "credential bundle presented to ateapi; its SPIFFE ID must hold substrate's egress_gateway role (required)")
+	auth := fs.String("openbao-auth", string(provider.AuthKubernetes), "how to log in to OpenBao: kubernetes, as this pod's ServiceAccount, or actor-jwt, as each actor with a minted substrate actor JWT")
+	fs.StringVar(&c.provider.AuthMount, "openbao-auth-mount", "", "path the OpenBao auth method is mounted at (default kubernetes or jwt, by --openbao-auth)")
+	fs.StringVar(&c.provider.Role, "openbao-role", "", "OpenBao auth role to log in as (default substrate-credential-provider or substrate-actor, by --openbao-auth)")
+	fs.StringVar(&c.provider.TokenFile, "service-account-token-file", "/var/run/secrets/openbao/token", "with --openbao-auth=kubernetes: ServiceAccount token presented to OpenBao, projected with OpenBao's audience")
+
+	fs.StringVar(&c.ateapiAddr, "ateapi-address", "dns:///api.ate-system.svc:443", "with --openbao-auth=actor-jwt: gRPC target of substrate's ateapi, which mints actor JWTs")
+	fs.StringVar(&c.ateapiCAFile, "ateapi-ca-file", "", "with --openbao-auth=actor-jwt: trust bundle ateapi's serving certificate must chain to (required)")
+	fs.StringVar(&c.ateapiClientCert, "ateapi-client-cert", "", "with --openbao-auth=actor-jwt: credential bundle presented to ateapi; its SPIFFE ID must hold substrate's egress_gateway role (required)")
 	fs.StringVar(&c.ateapiServerName, "ateapi-server-name", "api.ate-system.svc", "DNS name ateapi's serving certificate must carry")
 
 	fs.StringVar(&c.openbaoAddr, "openbao-address", "", "OpenBao base URL, e.g. https://openbao.openbao.svc:8200 (required)")
@@ -96,29 +101,47 @@ func parseFlags(fs *flag.FlagSet, args []string) (config, error) {
 	fs.BoolVar(&c.openbaoAllowInsecureHTTP, "openbao-allow-insecure-http", false, "allow a plain http --openbao-address; actor tokens and secrets then cross the network in cleartext (local development only)")
 
 	fs.StringVar(&c.provider.ProviderName, "provider-name", "openbao", "ate-secret:// URI host this provider serves; must match the name substrate's --credential-provider gives it")
-	fs.StringVar(&c.provider.JWTMount, "openbao-jwt-mount", "jwt", "path the OpenBao JWT auth method is mounted at")
-	fs.StringVar(&c.provider.Role, "openbao-role", "substrate-actor", "OpenBao JWT auth role actors log in as")
-	fs.StringVar(&c.provider.Audience, "actor-jwt-audience", "openbao", "audience of the minted actor JWTs; the OpenBao role must bind it")
-	fs.DurationVar(&c.provider.JWTLifetime, "actor-jwt-lifetime", 300*time.Second, "lifetime of the minted actor JWTs, 300s to 3600s; each is used once, to log in")
+	fs.StringVar(&c.provider.Audience, "actor-jwt-audience", "openbao", "with --openbao-auth=actor-jwt: audience of the minted actor JWTs; the OpenBao role must bind it")
+	fs.DurationVar(&c.provider.JWTLifetime, "actor-jwt-lifetime", 300*time.Second, "with --openbao-auth=actor-jwt: lifetime of the minted actor JWTs, 300s to 3600s; each is used once, to log in")
 	// The egress gateway allows a provider about four seconds.
 	fs.DurationVar(&c.provider.FetchTimeout, "fetch-timeout", 3*time.Second, "how long one FetchSecret may take, including any ateapi mint and OpenBao login; keep it under the egress gateway's provider timeout")
 
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
 	}
+	c.provider.Auth = provider.Auth(*auth)
+	defaultMount, defaultRole := "kubernetes", "substrate-credential-provider"
+	if c.provider.Auth == provider.AuthActorJWT {
+		defaultMount, defaultRole = "jwt", "substrate-actor"
+	}
+	if c.provider.AuthMount == "" {
+		c.provider.AuthMount = defaultMount
+	}
+	if c.provider.Role == "" {
+		c.provider.Role = defaultRole
+	}
 	return c, c.validate()
 }
 
 func (c config) validate() error {
-	for _, f := range []struct{ name, value string }{
+	required := []struct{ name, value string }{
 		{"--server-cred-bundle", c.serverBundle},
 		{"--client-ca-file", c.clientCAFile},
 		{"--injector-identity", c.injectorIdentity},
-		{"--ateapi-ca-file", c.ateapiCAFile},
-		{"--ateapi-client-cert", c.ateapiClientCert},
-		{"--ateapi-server-name", c.ateapiServerName},
 		{"--openbao-address", c.openbaoAddr},
-	} {
+	}
+	switch c.provider.Auth {
+	case provider.AuthKubernetes:
+	case provider.AuthActorJWT:
+		required = append(required, []struct{ name, value string }{
+			{"--ateapi-ca-file", c.ateapiCAFile},
+			{"--ateapi-client-cert", c.ateapiClientCert},
+			{"--ateapi-server-name", c.ateapiServerName},
+		}...)
+	default:
+		return fmt.Errorf("--openbao-auth must be %s or %s, got %q", provider.AuthKubernetes, provider.AuthActorJWT, c.provider.Auth)
+	}
+	for _, f := range required {
 		if f.value == "" {
 			return fmt.Errorf("%s is required", f.name)
 		}
@@ -146,9 +169,9 @@ func main() {
 	}
 }
 
-// newServer builds the gRPC server and the ateapi connection it mints through.
-// The caller closes the connection.
-func newServer(cfg config) (*grpc.Server, *grpc.ClientConn, error) {
+// newServer builds the gRPC server and, with --openbao-auth=actor-jwt, the
+// ateapi connection it mints through. The caller calls cleanup when done.
+func newServer(cfg config) (srv *grpc.Server, cleanup func(), err error) {
 	creds, err := mtls.ServerCredentials(mtls.Config{
 		ServerBundle:   cfg.serverBundle,
 		ClientCAFile:   cfg.clientCAFile,
@@ -157,37 +180,42 @@ func newServer(cfg config) (*grpc.Server, *grpc.ClientConn, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("server credentials: %w", err)
 	}
-
-	ateapiTLS, err := tlsclient.New(tlsclient.Config{
-		CAFile:           cfg.ateapiCAFile,
-		ServerName:       cfg.ateapiServerName,
-		ClientCredBundle: cfg.ateapiClientCert,
-	})
-	if err != nil {
-		return nil, nil, fmt.Errorf("ateapi client TLS: %w", err)
-	}
-	conn, err := grpc.NewClient(cfg.ateapiAddr,
-		grpc.WithTransportCredentials(credentials.NewTLS(ateapiTLS)),
-		// Spread mints across every ateapi replica the resolver returns.
-		grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"round_robin":{}}]}`),
-	)
-	if err != nil {
-		return nil, nil, fmt.Errorf("ateapi client: %w", err)
-	}
-
 	store, err := newOpenBaoClient(cfg)
 	if err != nil {
-		conn.Close()
 		return nil, nil, err
 	}
-	p, err := provider.NewServer(cfg.provider, ateapi.NewControlClient(conn), store)
+
+	cleanup = func() {}
+	var minter provider.Minter
+	if cfg.provider.Auth == provider.AuthActorJWT {
+		ateapiTLS, err := tlsclient.New(tlsclient.Config{
+			CAFile:           cfg.ateapiCAFile,
+			ServerName:       cfg.ateapiServerName,
+			ClientCredBundle: cfg.ateapiClientCert,
+		})
+		if err != nil {
+			return nil, nil, fmt.Errorf("ateapi client TLS: %w", err)
+		}
+		conn, err := grpc.NewClient(cfg.ateapiAddr,
+			grpc.WithTransportCredentials(credentials.NewTLS(ateapiTLS)),
+			// Spread mints across every ateapi replica the resolver returns.
+			grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"round_robin":{}}]}`),
+		)
+		if err != nil {
+			return nil, nil, fmt.Errorf("ateapi client: %w", err)
+		}
+		cleanup = func() { conn.Close() }
+		minter = ateapi.NewControlClient(conn)
+	}
+
+	p, err := provider.NewServer(cfg.provider, minter, store)
 	if err != nil {
-		conn.Close()
+		cleanup()
 		return nil, nil, err
 	}
-	srv := grpc.NewServer(grpc.Creds(creds))
+	srv = grpc.NewServer(grpc.Creds(creds))
 	credprovider.RegisterCredentialProviderServer(srv, p)
-	return srv, conn, nil
+	return srv, cleanup, nil
 }
 
 func newOpenBaoClient(cfg config) (*openbao.Client, error) {
@@ -213,15 +241,15 @@ func newOpenBaoClient(cfg config) (*openbao.Client, error) {
 }
 
 func run(ctx context.Context, cfg config) error {
-	srv, conn, err := newServer(cfg)
+	srv, cleanup, err := newServer(cfg)
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer cleanup()
 	slog.Info("admitting callers", slog.String("client_ca", cfg.clientCAFile), slog.String("required_san", cfg.injectorIdentity))
 	slog.Info("resolving secrets from OpenBao", slog.String("address", cfg.openbaoAddr),
-		slog.String("jwt_mount", cfg.provider.JWTMount), slog.String("role", cfg.provider.Role),
-		slog.String("ateapi", cfg.ateapiAddr))
+		slog.String("auth", string(cfg.provider.Auth)), slog.String("auth_mount", cfg.provider.AuthMount),
+		slog.String("role", cfg.provider.Role))
 
 	grpcLis, err := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.listenAddr)
 	if err != nil {

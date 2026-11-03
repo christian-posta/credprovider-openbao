@@ -61,7 +61,7 @@ func TestNewValidatesAddress(t *testing.T) {
 	}
 }
 
-func TestLoginJWT(t *testing.T) {
+func TestLogin(t *testing.T) {
 	c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/auth/jwt/login" {
 			t.Errorf("got %s %s, want POST /v1/auth/jwt/login", r.Method, r.URL.Path)
@@ -78,7 +78,7 @@ func TestLoginJWT(t *testing.T) {
 		}
 		_, _ = io.WriteString(w, `{"auth":{"client_token":"s.tok","lease_duration":300}}`)
 	})
-	tok, err := c.LoginJWT(context.Background(), "jwt", "substrate-actor", "the.actor.jwt")
+	tok, err := c.Login(context.Background(), "jwt", "substrate-actor", "the.actor.jwt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestLoginJWT(t *testing.T) {
 	}
 }
 
-func TestLoginJWTErrors(t *testing.T) {
+func TestLoginErrors(t *testing.T) {
 	for _, tt := range []struct {
 		status   int
 		body     string
@@ -103,7 +103,7 @@ func TestLoginJWTErrors(t *testing.T) {
 			w.WriteHeader(tt.status)
 			_, _ = io.WriteString(w, tt.body)
 		})
-		_, err := c.LoginJWT(context.Background(), "jwt", "r", "j")
+		_, err := c.Login(context.Background(), "jwt", "r", "j")
 		if err == nil {
 			t.Errorf("HTTP %d %s: login succeeded", tt.status, tt.body)
 			continue
@@ -122,9 +122,12 @@ func TestReadKV2(t *testing.T) {
 		if got := r.Header.Get("X-Vault-Token"); got != "s.tok" {
 			t.Errorf("token header = %q", got)
 		}
+		if got := r.Header.Get(ActorHeader); got != "actor/team-a/alpha" {
+			t.Errorf("actor header = %q", got)
+		}
 		_, _ = io.WriteString(w, `{"data":{"data":{"token":"hunter2","n":1},"metadata":{"version":3}}}`)
 	})
-	data, err := c.ReadKV2(context.Background(), "s.tok", "secret", []string{"atespaces", "team-a", "example-api"})
+	data, err := c.ReadKV2(context.Background(), "s.tok", "actor/team-a/alpha", "secret", []string{"atespaces", "team-a", "example-api"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +152,7 @@ func TestReadKV2Errors(t *testing.T) {
 			w.WriteHeader(tt.status)
 			_, _ = io.WriteString(w, tt.body)
 		})
-		_, err := c.ReadKV2(context.Background(), "t", "secret", []string{"p"})
+		_, err := c.ReadKV2(context.Background(), "t", "a", "secret", []string{"p"})
 		if got := StatusCode(err); got != tt.wantCode {
 			t.Errorf("HTTP %d %q: StatusCode = %d, want %d (err %v)", tt.status, tt.body, got, tt.wantCode, err)
 		}
@@ -160,7 +163,7 @@ func TestDecodeErrorDoesNotQuoteBody(t *testing.T) {
 	c := newClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{"data":{"data":"hunter2-not-an-object"}}`)
 	})
-	_, err := c.ReadKV2(context.Background(), "t", "secret", []string{"p"})
+	_, err := c.ReadKV2(context.Background(), "t", "a", "secret", []string{"p"})
 	if err == nil || strings.Contains(err.Error(), "hunter2") {
 		t.Errorf("err = %v, want a decode error that does not quote the body", err)
 	}
@@ -175,7 +178,7 @@ func TestDoesNotFollowRedirects(t *testing.T) {
 	c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, elsewhere.URL+"/steal", http.StatusTemporaryRedirect)
 	})
-	if _, err := c.ReadKV2(context.Background(), "s.tok", "secret", []string{"p"}); StatusCode(err) != http.StatusTemporaryRedirect {
+	if _, err := c.ReadKV2(context.Background(), "s.tok", "a", "secret", []string{"p"}); StatusCode(err) != http.StatusTemporaryRedirect {
 		t.Errorf("err = %v, want the redirect reported as a status error", err)
 	}
 	select {
@@ -191,7 +194,7 @@ func TestContextTimeout(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	if _, err := c.ReadKV2(ctx, "t", "secret", []string{"p"}); err == nil || StatusCode(err) != 0 {
+	if _, err := c.ReadKV2(ctx, "t", "a", "secret", []string{"p"}); err == nil || StatusCode(err) != 0 {
 		t.Errorf("err = %v, want a transport error", err)
 	}
 }
